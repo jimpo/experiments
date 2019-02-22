@@ -5,7 +5,7 @@ authors = ["Jim Posen <jim.posen@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-bulletproofs = { git = "https://github.com/dalek-cryptography/bulletproofs", branch = "develop", features = ["yoloproofs"] }
+bulletproofs = { git = "https://github.com/jimpo/bulletproofs", branch = "develop", features = ["yoloproofs"] }
 curve25519-dalek = { version = "1.0.0", features = ["serde"] }
 merlin = "1.0.3"
 rand = "0.6.5"
