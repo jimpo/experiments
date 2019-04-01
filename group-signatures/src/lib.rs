@@ -6,6 +6,14 @@ use group::{CurveAffine, CurveProjective};
 use rand::{Rand, Rng};
 use pairing::Engine;
 
+/*
+* This is an implementation of group signatures based on the Pointcheval-Sanders randomizable
+* signature scheme in https://eprint.iacr.org/2015/525.pdf. The group signature is constructed
+* in the sign-encrypt-proof paradigm using El-Gamal encryption and a Schnorr-style sigma proof.
+* The scheme is defined over elliptic curve groups Group1, Group2, GroupT with a type-3 pairing
+* e: Group1 x Group2 => GroupT.
+*/
+
 pub struct GroupManagerKey<E: Engine> {
     x: E::Fr,
     y: E::Fr,
@@ -42,6 +50,13 @@ pub struct GroupSignature<E: Engine> {
     s_m: E::Fr,
 }
 
+/**
+* Generates a group manager key along with the group public key.
+*
+* The group manager chooses generators G1, G2 and scalars x, y, and t. The public key consists of
+* G1, G2, X = G2^x, Y = G2^y, and T = G1^t. X and Y are used as in Pointcheval-Sanders signatures
+* and T is the tracing key that El-Gamal ciphertexts are encrypted to.
+*/
 pub fn gen<E: Engine, R: Rng>(rng: &mut R) -> GroupManagerKey<E> {
     let g1 = E::G1Affine::one();
     let g2 = E::G2Affine::one();
@@ -63,14 +78,23 @@ pub fn gen<E: Engine, R: Rng>(rng: &mut R) -> GroupManagerKey<E> {
     }
 }
 
+/**
+* The group manager issues a new group secret key.
+*
+* The key holder chooses M in Group1 which they know the discrete logarithm m of with respect to G1.
+* The group manager chooses a scalar h. The key consists of m, H = G1^h, W = (G1^x * M^y)^h, where
+* (H, W) is a Pointcheval-Sanders signature.
+*/
 pub fn issue<E: Engine, R: Rng>(rng: &mut R, gm_key: &GroupManagerKey<E>, m_g1: &E::G1Affine)
     -> (E::G1, E::G1)
 {
     let pubkey = &gm_key.pubkey;
 
+    // H = G1^h
     let h = E::Fr::rand(rng);
     let h_g1 = pubkey.g1.mul(h);
 
+    // W = (G1^x * M^y)^h
     let mut w_g1 = m_g1.mul(gm_key.y.clone());
     w_g1.add_assign(&gm_key.x_g1);
     w_g1.mul_assign(h);
@@ -78,6 +102,41 @@ pub fn issue<E: Engine, R: Rng>(rng: &mut R, gm_key: &GroupManagerKey<E>, m_g1: 
     (h_g1, w_g1)
 }
 
+/**
+* A group member produces a signature using their group secret key.
+*
+* The member chooses scalars u, v, k. u, v are used to randomize the (H, W) issued by the group
+* manager and k is the nonce used in the El-Gamal encryption. The member computes:
+*
+* A = H^u
+* B = (W * H^v)^u
+* K = G1^k
+* L = M * T^k
+*
+* (A, B) is a randomized Pointchevel-Sanders signature and (K, L) is an El-Gamal encryption of M.
+*
+* The member then produces a signature of knowledge of v, k, m satisfying:
+*
+* e(A, G2^v * X * Y^m) = e(B, G2)
+* K = G1^k
+* L = G1^m * T^k
+*
+* The member chooses scalars r_v, r_k, r_m and computes:
+*
+* R_e = e(A, G2^r_v * Y*r_m)
+* R_k = G1^r_k
+* R_l = G1^r_m * T^r_k
+*
+* The member computes the random oracle challenge
+*
+* c = HashToScalar(msg || A || B || K || L || R_e || R_k || R_l)
+*
+* The signature consists of A, B, K, L, c, s_v, s_k, s_m where
+*
+* s_v = r_v + c * v
+* s_k = r_k + c * k
+* s_m = r_m + c * m
+*/
 pub fn sign<E: Engine, R: Rng>(rng: &mut R, key: &GroupSecretKey<E>, msg: &[u8]) -> GroupSignature<E> {
     let pubkey = &key.pubkey;
 
@@ -168,11 +227,23 @@ pub fn sign<E: Engine, R: Rng>(rng: &mut R, key: &GroupSecretKey<E>, msg: &[u8])
     }
 }
 
+/**
+* Verify a group signature.
+*
+* The verifier computes:
+*
+* \hat R_e = e(A, G2^s_v * X^c * Y^s_m) / e(B, G2)^c
+* \hat R_k = G1^s_k / K^C
+* \hat R_l = G1^s_m * T^s_k / L^c
+* \hat c = HashToScalar(msg || A || B || K || L || \hat R_e || \hat R_k || \hat R_l)
+*
+* then checks that \hat c = c.
+*/
 pub fn verify<E: Engine>(pubkey: &GroupPublicKey<E>, msg: &[u8], sig: &GroupSignature<E>) -> bool {
     let mut neg_c = sig.c.clone();
     neg_c.negate();
 
-    // R_e = e(A, G2^s_v * X^c * Y^s_k) / e(B, G2)^c
+    // R_e = e(A, G2^s_v * X^c * Y^s_m) / e(B, G2)^c
     let r_e_den = E::pairing(sig.b_g1.clone(), pubkey.g2.clone());
     let r_e_den = r_e_den.pow(neg_c.into_repr());
 
@@ -224,6 +295,11 @@ pub fn verify<E: Engine>(pubkey: &GroupPublicKey<E>, msg: &[u8], sig: &GroupSign
     c == sig.c
 }
 
+/**
+* The group manager determines the signer of a group signature.
+*
+* The signer's identity key M is the decryption of the El-Gamal ciphertext (K, L) in the signature.
+*/
 pub fn trace<E: Engine>(gm_key: &GroupManagerKey<E>, sig: &GroupSignature<E>) -> E::G1 {
     // M = L * K^{-t}
     let mut neg_t = gm_key.t.clone();
@@ -236,6 +312,11 @@ pub fn trace<E: Engine>(gm_key: &GroupManagerKey<E>, sig: &GroupSignature<E>) ->
     m_g1
 }
 
+/**
+* Interpret a 32-byte hash output as a scalar.
+*
+* See to_uniform and hash_to_scalar in the sapling-crypto crate.
+*/
 fn hash_result_scalar<F: Field, H: VariableOutput>(hash: H) -> F {
     let one = F::one();
 
