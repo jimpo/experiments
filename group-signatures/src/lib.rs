@@ -103,6 +103,24 @@ pub fn issue<E: Engine, R: Rng>(rng: &mut R, gm_key: &GroupManagerKey<E>, m_g1: 
 }
 
 /**
+* A group member verifies that their secret key issued by the group manager is valid.
+*
+* They check that the relation holds:
+*
+* e(H, X * Y^m) = e(W, G2)
+*/
+pub fn verify_key<E: Engine>(pubkey: &GroupPublicKey<E>, key: &GroupSecretKey<E>) -> bool
+{
+    let mut lhs_g2 = pubkey.y_g2.clone();
+    lhs_g2.mul_assign(key.m.into_repr());
+    lhs_g2.add_assign(&pubkey.x_g2);
+
+    let lhs = E::pairing(key.h_g1.clone(), lhs_g2);
+    let rhs = E::pairing(key.w_g1.clone(), pubkey.g2.clone());
+    lhs == rhs
+}
+
+/**
 * A group member produces a signature using their group secret key.
 *
 * The member chooses scalars u, v, k. u, v are used to randomize the (H, W) issued by the group
@@ -239,7 +257,7 @@ pub fn sign<E: Engine, R: Rng>(rng: &mut R, key: &GroupSecretKey<E>, msg: &[u8])
 *
 * then checks that \hat c = c.
 */
-pub fn verify<E: Engine>(pubkey: &GroupPublicKey<E>, msg: &[u8], sig: &GroupSignature<E>) -> bool {
+pub fn verify_sig<E: Engine>(pubkey: &GroupPublicKey<E>, msg: &[u8], sig: &GroupSignature<E>) -> bool {
     let mut neg_c = sig.c.clone();
     neg_c.negate();
 
@@ -359,10 +377,11 @@ mod tests {
             w_g1,
             pubkey: pubkey.clone()
         };
+        assert!(verify_key(&pubkey, &key));
 
         let sig = sign(&mut rng, &key, b"Test");
-        assert!(verify(&pubkey, b"Test", &sig));
-        assert!(!verify(&pubkey, b"Fail", &sig));
+        assert!(verify_sig(&pubkey, b"Test", &sig));
+        assert!(!verify_sig(&pubkey, b"Fail", &sig));
         assert_eq!(trace(&gm_key, &sig), m_g1);
     }
 }
