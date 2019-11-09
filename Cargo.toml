@@ -3,4 +3,5 @@
 members = [
     "bulletproof-gadgets",
     "group-signatures",
+    "ring-signatures",
 ]
