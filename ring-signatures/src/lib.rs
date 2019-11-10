@@ -7,13 +7,15 @@ use crate::util::ScalarPowersIterator;
 use curve25519_dalek::{
 	ristretto::{RistrettoPoint},
 	scalar::Scalar,
-	traits::MultiscalarMul,
+	traits::{MultiscalarMul, VartimeMultiscalarMul},
 };
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use std::borrow::Borrow;
 use std::convert::TryFrom;
 use std::iter;
+use crate::ProofError::RingIsEmpty;
+use curve25519_dalek::traits::IsIdentity;
 
 pub struct PublicParams {
 	label: &'static [u8],
@@ -164,13 +166,74 @@ pub fn prove<R>(
 	})
 }
 
+struct VerifyCondition {
+	g_scalar: Scalar,
+	h_scalar: Scalar,
+	scalars: Vec<Scalar>,
+	points: Vec<RistrettoPoint>,
+}
+
+impl VerifyCondition {
+	fn scale(self, x: Scalar) -> VerifyCondition {
+		VerifyCondition {
+			g_scalar: self.g_scalar * x,
+			h_scalar: self.h_scalar * x,
+			scalars: self.scalars.into_iter()
+				.map(|scalar| scalar * x)
+				.collect(),
+			points: self.points,
+		}
+	}
+
+	fn combine(self, other: VerifyCondition) -> VerifyCondition {
+		VerifyCondition {
+			g_scalar: self.g_scalar + other.g_scalar,
+			h_scalar: self.h_scalar + other.h_scalar,
+			scalars: self.scalars.into_iter()
+				.chain(other.scalars.into_iter())
+				.collect(),
+			points: self.points.into_iter()
+				.chain(other.points.into_iter())
+				.collect(),
+		}
+	}
+
+	fn verify(&self, params: &PublicParams) -> bool {
+		RistrettoPoint::vartime_multiscalar_mul(
+			self.scalars.iter().chain(vec![&self.g_scalar, &self.h_scalar].into_iter()),
+			self.points.iter().chain(vec![&params.g, &params.h].into_iter()),
+		).is_identity()
+	}
+
+	fn verify_many<R, I>(params: &PublicParams, rng: &mut R, conditions: I) -> bool
+		where
+			R: RngCore + CryptoRng,
+			I: IntoIterator<Item=Self>,
+	{
+		let mut conditions_iter = conditions.into_iter();
+		let first_condition = match conditions_iter.next() {
+			Some(condition) => condition,
+			None => return false,
+		};
+
+		conditions_iter
+			.fold(first_condition, |combined, condition| {
+				combined.combine(condition.scale(Scalar::random(rng)))
+			})
+			.verify(params)
+	}
+}
+
 /// :param: c a vector of Pedersen commitments
 /// :param: pi a proof tuple
-pub fn verify(
+pub fn verify<R>(
 	params: &PublicParams,
+	rng: &mut R,
 	pubkeys: &[RistrettoPoint],
 	proof: Proof,
 ) -> Result<bool, VerifyError>
+	where
+		R: RngCore + CryptoRng,
 {
 	let len = u32::try_from(pubkeys.len())
 		.map_err(|_| VerifyError::RingTooLarge)?;
@@ -203,13 +266,20 @@ pub fn verify(
 
 	let x = challenge_scalar(&mut transcript, b"x");
 
+	let mut conditions = Vec::with_capacity(2 * log_n as usize + 1);
 	for j in 0..(log_n as usize) {
-		if x * c_l[j] + c_a[j] != pedersen_commit(params, &f[j], &z_a[j]) {
-			return Ok(false);
-		}
-		if (x - f[j]) * c_l[j] + c_b[j] != pedersen_commit(params, &Scalar::zero(), &z_b[j]) {
-			return Ok(false);
-		}
+		conditions.push(VerifyCondition {
+			g_scalar: -z_a[j],
+			h_scalar: -f[j],
+			scalars: vec![x, Scalar::one()],
+			points: vec![c_l[j], c_a[j]],
+		});
+		conditions.push(VerifyCondition {
+			g_scalar: -z_b[j],
+			h_scalar: Scalar::zero(),
+			scalars: vec![x - f[j], Scalar::one()],
+			points: vec![c_l[j], c_b[j]],
+		});
 	}
 
 	let c_exp = (0..n as usize)
@@ -230,16 +300,14 @@ pub fn verify(
 		.map(|x_j| -x_j)
 		.collect::<Vec<_>>();
 
-	let lhs = RistrettoPoint::multiscalar_mul(
-		c_exp.chain(c_d_exp.into_iter()),
-		c.iter().cloned().chain(c_d.iter()),
-	);
-	if lhs != pedersen_commit(params, &Scalar::zero(), &z_d) {
-		println!("failed last check");
-		return Ok(false);
-	}
+	conditions.push(VerifyCondition {
+		g_scalar: -z_d,
+		h_scalar: Scalar::zero(),
+		scalars: c_exp.chain(c_d_exp.into_iter()).collect(),
+		points: c.into_iter().cloned().chain(c_d.into_iter()).collect(),
+	});
 
-	Ok(true)
+	Ok(VerifyCondition::verify_many(params, rng, conditions))
 }
 
 fn serialize_points(c: &[RistrettoPoint]) -> Vec<u8> {
@@ -361,7 +429,7 @@ mod tests {
 		let idx = rng.gen_range(0, keys.len());
 
 		let proof = prove(&params, &mut rng, &pubkeys, idx as u32, keys[idx]).unwrap();
-		assert!(verify(&params, &pubkeys, proof).unwrap());
+		assert!(verify(&params, &mut rng, &pubkeys, proof).unwrap());
 	}
 
 	#[test]
