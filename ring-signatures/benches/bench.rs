@@ -1,7 +1,12 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+use curve25519_dalek::{
+	ristretto::RistrettoPoint,
+	scalar::Scalar,
+};
 use rand::{Rng, thread_rng};
-use ring_signatures::{PublicParams, compute_p_coefficients, prove, verify};
+use ring_signatures::{
+	PublicParams, compute_p_coefficients, prove, verify, precompute_verifier_static_points,
+};
 
 const RING_SIZE: usize = 1000;
 
@@ -65,16 +70,16 @@ fn bench_verifier(c: &mut Criterion) {
 	let proof = prove(&params, &mut rng, &pubkeys, idx as u32, keys[idx])
 		.unwrap();
 
+	let static_points = precompute_verifier_static_points(&params, &pubkeys);
+
 	c.bench_function("verifier", |b| {
 		b.iter(|| {
-			assert!(verify(&params, &mut rng, &pubkeys, &proof).unwrap());
+			assert!(verify(&params, &static_points, &mut rng, &pubkeys, &proof).unwrap());
 		})
 	});
 }
 
 criterion_group!(benches,
-	bench_compute_p_coefficients,
-	bench_prover,
 	bench_verifier,
 );
 criterion_main!(benches);

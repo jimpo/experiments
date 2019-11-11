@@ -5,16 +5,16 @@ use crate::matrix::{MatrixMN, MatrixNN};
 use crate::util::ScalarPowersIterator;
 
 use curve25519_dalek::{
-	ristretto::RistrettoPoint,
+	ristretto::{CompressedRistretto, RistrettoPoint, VartimeRistrettoPrecomputation},
 	scalar::Scalar,
-	traits::{MultiscalarMul, VartimeMultiscalarMul},
+	traits::{IsIdentity, MultiscalarMul, VartimePrecomputedMultiscalarMul},
 };
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use std::borrow::Borrow;
+use std::collections::{HashMap, hash_map};
 use std::convert::TryFrom;
 use std::iter;
-use curve25519_dalek::traits::IsIdentity;
 
 pub struct PublicParams {
 	pub label: &'static [u8],
@@ -164,45 +164,87 @@ pub fn prove<R>(
 }
 
 struct VerifyCondition {
-	g_scalar: Scalar,
-	h_scalar: Scalar,
-	scalars: Vec<Scalar>,
-	points: Vec<RistrettoPoint>,
+	static_scalars: Vec<Scalar>,
+	dynamic_scalars: HashMap<[u8; 32], Scalar>,
 }
 
 impl VerifyCondition {
-	fn scale(self, x: Scalar) -> VerifyCondition {
+	fn new<I1, I2, I3>(
+		g_scalar: Scalar,
+		h_scalar: Scalar,
+		c_scalars: I1,
+		dynamic_scalars: I2,
+		dynamic_points: I3,
+	) -> Self
+		where
+			I1: IntoIterator<Item=Scalar>,
+			I2: IntoIterator<Item=Scalar>,
+			I3: IntoIterator,
+			I3::Item: Borrow<RistrettoPoint>,
+	{
 		VerifyCondition {
-			g_scalar: self.g_scalar * x,
-			h_scalar: self.h_scalar * x,
-			scalars: self.scalars.into_iter()
-				.map(|scalar| scalar * x)
+			static_scalars: vec![g_scalar, h_scalar].into_iter()
+				.chain(c_scalars)
 				.collect(),
-			points: self.points,
+			// TODO: This collect needs to check for duplicate dynamic points.
+			dynamic_scalars: dynamic_points.into_iter()
+				.map(|point| point.borrow().compress().to_bytes())
+				.zip(dynamic_scalars)
+				.collect(),
 		}
 	}
 
-	fn combine(self, other: VerifyCondition) -> VerifyCondition {
-		VerifyCondition {
-			g_scalar: self.g_scalar + other.g_scalar,
-			h_scalar: self.h_scalar + other.h_scalar,
-			scalars: self.scalars.into_iter()
-				.chain(other.scalars.into_iter())
-				.collect(),
-			points: self.points.into_iter()
-				.chain(other.points.into_iter())
-				.collect(),
+	fn scale(mut self, x: Scalar) -> VerifyCondition {
+		for scalar in self.static_scalars.iter_mut() {
+			*scalar *= &x;
 		}
+		for (_, scalar) in self.dynamic_scalars.iter_mut() {
+			*scalar *= &x;
+		}
+		self
 	}
 
-	fn verify(&self, params: &PublicParams) -> bool {
-		RistrettoPoint::vartime_multiscalar_mul(
-			self.scalars.iter().chain(vec![&self.g_scalar, &self.h_scalar].into_iter()),
-			self.points.iter().chain(vec![&params.g, &params.h].into_iter()),
+	fn combine(mut self, other: VerifyCondition) -> VerifyCondition {
+		for (scalar1, scalar2) in self.static_scalars.iter_mut().zip(other.static_scalars.into_iter()) {
+			*scalar1 += &scalar2;
+		}
+		for (point_repr, scalar) in other.dynamic_scalars.into_iter() {
+			match self.dynamic_scalars.entry(point_repr) {
+				hash_map::Entry::Vacant(entry) => {
+					entry.insert(scalar);
+				}
+				hash_map::Entry::Occupied(mut entry) => {
+					let new_value = entry.get() + scalar;
+					entry.insert(new_value);
+				}
+			}
+		}
+		self
+	}
+
+	fn verify(&self, static_points: &VartimeRistrettoPrecomputation) -> bool {
+		let (dynamic_scalars, dynamic_points): (Vec<Scalar>, Vec<RistrettoPoint>) =
+			self.dynamic_scalars.iter()
+				.map(|(point_repr, scalar)| {
+					let point = CompressedRistretto::from_slice(&point_repr[..])
+						.decompress()
+						.expect("stored point representations are valid");
+					(scalar, point)
+				})
+				.unzip();
+
+		static_points.vartime_mixed_multiscalar_mul(
+			self.static_scalars.iter(),
+			dynamic_scalars.into_iter(),
+			dynamic_points.into_iter(),
 		).is_identity()
 	}
 
-	fn verify_many<R, I>(params: &PublicParams, rng: &mut R, conditions: I) -> bool
+	fn verify_many<R, I>(
+		rng: &mut R,
+		static_points: &VartimeRistrettoPrecomputation,
+		conditions: I,
+	) -> bool
 		where
 			R: RngCore + CryptoRng,
 			I: IntoIterator<Item=Self>,
@@ -217,7 +259,7 @@ impl VerifyCondition {
 			.fold(first_condition, |combined, condition| {
 				combined.combine(condition.scale(Scalar::random(rng)))
 			})
-			.verify(params)
+			.verify(static_points)
 	}
 }
 
@@ -225,6 +267,7 @@ impl VerifyCondition {
 /// :param: pi a proof tuple
 pub fn verify<R>(
 	params: &PublicParams,
+	static_points: &VartimeRistrettoPrecomputation,
 	rng: &mut R,
 	pubkeys: &[RistrettoPoint],
 	proof: &Proof,
@@ -242,7 +285,7 @@ pub fn verify<R>(
 	transcript.append_u64(b"RING LEN", len as u64);
 	transcript.append_message(b"RING", &serialize_points(pubkeys));
 
-	let (c, n, log_n) = pad_ring(pubkeys);
+	let (_, n, log_n) = pad_ring(pubkeys);
 
 	let Proof {
 		c_l,
@@ -264,18 +307,21 @@ pub fn verify<R>(
 
 	let mut conditions = Vec::with_capacity(2 * log_n as usize + 1);
 	for j in 0..(log_n as usize) {
-		conditions.push(VerifyCondition {
-			g_scalar: -z_a[j],
-			h_scalar: -f[j],
-			scalars: vec![x, Scalar::one()],
-			points: vec![c_l[j], c_a[j]],
-		});
-		conditions.push(VerifyCondition {
-			g_scalar: -z_b[j],
-			h_scalar: Scalar::zero(),
-			scalars: vec![x - f[j], Scalar::one()],
-			points: vec![c_l[j], c_b[j]],
-		});
+		conditions.push(VerifyCondition::new(
+			-z_a[j],
+			-f[j],
+			(0..n).map(|_| Scalar::zero()),
+			vec![x, Scalar::one()],
+			vec![c_l[j], c_a[j]],
+		));
+
+		conditions.push(VerifyCondition::new(
+			-z_b[j],
+			Scalar::zero(),
+			(0..n).map(|_| Scalar::zero()),
+			vec![x - f[j], Scalar::one()],
+			vec![c_l[j], c_b[j]],
+		));
 	}
 
 	let c_exp = (0..n as usize)
@@ -295,15 +341,15 @@ pub fn verify<R>(
 		.take(log_n as usize)
 		.map(|x_j| -x_j)
 		.collect::<Vec<_>>();
+	conditions.push(VerifyCondition::new(
+		-z_d,
+		Scalar::zero(),
+		c_exp,
+		c_d_exp,
+		c_d,
+	));
 
-	conditions.push(VerifyCondition {
-		g_scalar: -z_d,
-		h_scalar: Scalar::zero(),
-		scalars: c_exp.chain(c_d_exp.into_iter()).collect(),
-		points: c.into_iter().chain(c_d.into_iter()).cloned().collect(),
-	});
-
-	Ok(VerifyCondition::verify_many(params, rng, conditions))
+	Ok(VerifyCondition::verify_many(rng, static_points, conditions))
 }
 
 fn serialize_points(c: &[RistrettoPoint]) -> Vec<u8> {
@@ -394,6 +440,15 @@ fn challenge_scalar(transcript: &mut Transcript, label: &'static [u8]) -> Scalar
 	Scalar::from_bytes_mod_order_wide(&bytes)
 }
 
+pub fn precompute_verifier_static_points(params: &PublicParams, pubkeys: &[RistrettoPoint])
+	-> VartimeRistrettoPrecomputation
+{
+	let (c, _, _) = pad_ring(&pubkeys);
+	VartimeRistrettoPrecomputation::new(
+		vec![&params.g, &params.h].into_iter().chain(c.into_iter())
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -419,6 +474,8 @@ mod tests {
 		let idx = rng.gen_range(0, keys.len());
 
 		let proof = prove(&params, &mut rng, &pubkeys, idx as u32, keys[idx]).unwrap();
-		assert!(verify(&params, &mut rng, &pubkeys, &proof).unwrap());
+
+		let static_points = precompute_verifier_static_points(&params, &pubkeys);
+		assert!(verify(&params, &static_points, &mut rng, &pubkeys, &proof).unwrap());
 	}
 }
