@@ -25,7 +25,6 @@ pub struct PublicParams {
 #[derive(Debug)]
 pub enum ProofError {
 	IndexOutOfRange,
-	PrecomputedParamsError,
 	RingIsEmpty,
 	RingTooLarge,
 }
@@ -47,60 +46,6 @@ pub struct Proof {
 	z_d: Scalar,
 }
 
-pub struct PrecomputedProofParams {
-	n: u32,
-	x: Vec<Scalar>,
-	x_n_pow: Vec<Scalar>,
-	interpolation_mat: MatrixNN,
-}
-
-impl PrecomputedProofParams {
-	pub fn new(n: u32) -> Self {
-		let x = (1..=n)
-			.map(Scalar::from)
-			.collect::<Vec<_>>();
-		let x_powers_mat = MatrixNN::vandermonde(&x);
-		let x_n_pow = (0..n as usize)
-			.map(|i| x_powers_mat[(i, n as usize - 1)] * x[i])
-			.collect();
-		let x_powers_inv = x_powers_mat.inverse()
-			.expect("vandermonde matrix with distinct, non-zero points must be invertible");
-		PrecomputedProofParams {
-			n,
-			x,
-			x_n_pow,
-			interpolation_mat: x_powers_inv.transpose()
-		}
-	}
-
-	pub fn for_ring_len(len: usize) -> Result<Self, ProofError> {
-		let len = u32::try_from(len)
-			.map_err(|_| ProofError::RingTooLarge)?;
-		if len == 0 {
-			return Err(ProofError::RingIsEmpty);
-		}
-
-		let log_n = 32 - (len - 1).leading_zeros();
-		Ok(Self::new(log_n))
-	}
-
-	pub fn n(&self) -> u32 {
-		self.n
-	}
-
-	pub fn x(&self) -> &[Scalar] {
-		&self.x
-	}
-
-	pub fn x_n_power(&self) -> &[Scalar] {
-		&self.x_n_pow
-	}
-
-	pub fn interpolation_mat(&self) -> MatrixNN {
-		self.interpolation_mat.clone()
-	}
-}
-
 /// Proves that the signer has knowledge of the opening of at least one Pedersen commitment
 /// to 0 in a vector.
 ///
@@ -109,7 +54,6 @@ impl PrecomputedProofParams {
 /// :param: key the blinding factor of the idx'th commitment
 pub fn prove<R>(
 	params: &PublicParams,
-	precomputed_params: &PrecomputedProofParams,
 	rng: &mut R,
 	pubkeys: &[RistrettoPoint],
 	idx: u32,
@@ -168,7 +112,7 @@ pub fn prove<R>(
 		.map(|((a_j, l_j), t_j)| pedersen_commit(params, &(a_j * l_j), t_j))
 		.collect::<Vec<_>>();
 
-	let p = compute_p_coefficients(precomputed_params, n, log_n, idx, &a)?;
+	let p = compute_p_coefficients(n, log_n, idx, &a);
 
 	let c_d = (0..log_n as usize)
 		.map(|k| {
@@ -388,20 +332,14 @@ fn pedersen_commit(params: &PublicParams, x: &Scalar, r: &Scalar) -> RistrettoPo
 	RistrettoPoint::multiscalar_mul(vec![x, r], vec![params.h, params.g])
 }
 
-pub fn compute_p_coefficients(
-	params: &PrecomputedProofParams,
-	n: u32,
-	log_n: u32,
-	idx: u32,
-	a: &[Scalar],
-) -> Result<MatrixMN, ProofError>
-{
-	if params.n() != log_n {
-		return Err(ProofError::PrecomputedParamsError);
-	}
-
-	let x = params.x();
-	let x_n_power = params.x_n_power();
+pub fn compute_p_coefficients(n: u32, log_n: u32, idx: u32, a: &[Scalar]) -> MatrixMN {
+	let x = (1..=log_n)
+		.map(Scalar::from)
+		.collect::<Vec<_>>();
+	let x_powers_mat = MatrixNN::vandermonde(&x);
+	let x_log_n_powers = (0..log_n as usize)
+		.map(|i| x_powers_mat[(i, log_n as usize - 1)] * x[i])
+		.collect::<Vec<_>>();
 
 	let mut a_mat = MatrixNN::zeros(log_n as usize);
 	let mut x_mat = MatrixNN::zeros(log_n as usize);
@@ -432,10 +370,12 @@ pub fn compute_p_coefficients(
 
 	// Subtract away the only degree log_n monomial, ensuring all polynomials are degree <log_n.
 	for k in 0..(log_n as usize) {
-		v_mat[(idx as usize, k)] -= x_n_power[k];
+		v_mat[(idx as usize, k)] -= x_log_n_powers[k];
 	}
 
-	Ok(&v_mat * &(params.interpolation_mat().into()))
+	let x_powers_inv = x_powers_mat.clone().inverse()
+		.expect("vandermonde matrix with distinct, non-zero points must be invertible");
+	&v_mat * &(x_powers_inv.transpose().into())
 }
 
 fn inner_product<'a, IA, IB>(a: IA, b: IB) -> Scalar
@@ -468,8 +408,6 @@ mod tests {
 			g: RistrettoPoint::random(&mut rng),
 			h: RistrettoPoint::random(&mut rng),
 		};
-		let proof_params = PrecomputedProofParams::for_ring_len(25)
-			.unwrap();
 
 		let keys = (0..25)
 			.map(|_| Scalar::random(&mut rng))
@@ -480,8 +418,7 @@ mod tests {
 
 		let idx = rng.gen_range(0, keys.len());
 
-		let proof = prove(&params, &proof_params, &mut rng, &pubkeys, idx as u32, keys[idx])
-			.unwrap();
+		let proof = prove(&params, &mut rng, &pubkeys, idx as u32, keys[idx]).unwrap();
 		assert!(verify(&params, &mut rng, &pubkeys, &proof).unwrap());
 	}
 }
