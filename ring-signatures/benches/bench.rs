@@ -140,6 +140,6 @@ criterion_group! {
 	name = slow;
 	config = Criterion::default()
 		.sample_size(10);
-	targets = bench_verify_one,
+	targets = bench_verify_many,
 }
 criterion_main!(fast, slow);

@@ -163,20 +163,20 @@ pub fn prove<R>(
 }
 
 pub struct VerifyCondition {
-	static_scalars: Vec<Scalar>,
+	static_scalars: Vec<Option<Scalar>>,
 	dynamic_scalars: HashMap<[u8; 32], Scalar>,
 }
 
 impl VerifyCondition {
 	pub fn new<I1, I2, I3>(
-		g_scalar: Scalar,
-		h_scalar: Scalar,
+		g_scalar: Option<Scalar>,
+		h_scalar: Option<Scalar>,
 		c_scalars: I1,
 		dynamic_scalars: I2,
 		dynamic_points: I3,
 	) -> Self
 		where
-			I1: IntoIterator<Item=Scalar>,
+			I1: IntoIterator<Item=Option<Scalar>>,
 			I2: IntoIterator<Item=Scalar>,
 			I3: IntoIterator,
 			I3::Item: Borrow<RistrettoPoint>,
@@ -195,8 +195,10 @@ impl VerifyCondition {
 
 	// TODO: Use Mul trait.
 	pub fn scale(mut self, x: Scalar) -> VerifyCondition {
-		for scalar in self.static_scalars.iter_mut() {
-			*scalar *= &x;
+		for maybe_scalar in self.static_scalars.iter_mut() {
+			if let Some(ref mut scalar) = maybe_scalar {
+				*scalar *= x;
+			}
 		}
 		for (_, scalar) in self.dynamic_scalars.iter_mut() {
 			*scalar *= &x;
@@ -206,8 +208,16 @@ impl VerifyCondition {
 
 	// TODO: Use Add trait.
 	pub fn combine(mut self, other: VerifyCondition) -> VerifyCondition {
-		for (scalar1, scalar2) in self.static_scalars.iter_mut().zip(other.static_scalars.into_iter()) {
-			*scalar1 += &scalar2;
+		for (maybe_scalar1, maybe_scalar2) in
+			self.static_scalars.iter_mut().zip(other.static_scalars.into_iter())
+		{
+			let new_value = match (*maybe_scalar1, maybe_scalar2) {
+				(Some(scalar1), Some(scalar2)) => Some(scalar1 + scalar2),
+				(Some(scalar1), None) => Some(scalar1),
+				(None, Some(scalar2)) => Some(scalar2),
+				(None, None) => None,
+			};
+			*maybe_scalar1 = new_value;
 		}
 		for (point_repr, scalar) in other.dynamic_scalars.into_iter() {
 			match self.dynamic_scalars.entry(point_repr) {
@@ -235,7 +245,7 @@ impl VerifyCondition {
 				.unzip();
 
 		static_points.vartime_mixed_multiscalar_mul(
-			self.static_scalars.iter(),
+			self.static_scalars.iter().map(|scalar| scalar.unwrap_or(Scalar::zero())),
 			dynamic_scalars.into_iter(),
 			dynamic_points.into_iter(),
 		).is_identity()
@@ -300,17 +310,17 @@ pub fn verify(mut transcript: Transcript, ring_len: usize, proof: &Proof)
 	let mut conditions = Vec::with_capacity(2 * log_n as usize + 1);
 	for j in 0..(log_n as usize) {
 		conditions.push(VerifyCondition::new(
-			-z_a[j],
-			-f[j],
-			(0..n).map(|_| Scalar::zero()),
+			Some(-z_a[j]),
+			Some(-f[j]),
+			(0..n).map(|_| None),
 			vec![x, Scalar::one()],
 			vec![c_l[j], c_a[j]],
 		));
 
 		conditions.push(VerifyCondition::new(
-			-z_b[j],
-			Scalar::zero(),
-			(0..n).map(|_| Scalar::zero()),
+			Some(-z_b[j]),
+			None,
+			(0..n).map(|_| None),
 			vec![x - f[j], Scalar::one()],
 			vec![c_l[j], c_b[j]],
 		));
@@ -328,14 +338,15 @@ pub fn verify(mut transcript: Transcript, ring_len: usize, proof: &Proof)
 					if i_j == 0 { f0[j] } else { f1[j] }
 				})
 				.fold(Scalar::one(), |prod, f_ij| prod * f_ij)
-		});
+		})
+		.map(Some);
 	let c_d_exp = ScalarPowersIterator::new(x)
 		.take(log_n as usize)
 		.map(|x_j| -x_j)
 		.collect::<Vec<_>>();
 	conditions.push(VerifyCondition::new(
-		-z_d,
-		Scalar::zero(),
+		Some(-z_d),
+		None,
 		c_exp,
 		c_d_exp,
 		c_d,
