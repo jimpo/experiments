@@ -5,7 +5,7 @@ use crate::matrix::{MatrixMN, MatrixNN};
 use crate::util::ScalarPowersIterator;
 
 use curve25519_dalek::{
-	ristretto::{RistrettoPoint},
+	ristretto::RistrettoPoint,
 	scalar::Scalar,
 	traits::{MultiscalarMul, VartimeMultiscalarMul},
 };
@@ -14,13 +14,12 @@ use rand_core::{CryptoRng, RngCore};
 use std::borrow::Borrow;
 use std::convert::TryFrom;
 use std::iter;
-use crate::ProofError::RingIsEmpty;
 use curve25519_dalek::traits::IsIdentity;
 
 pub struct PublicParams {
-	label: &'static [u8],
-	g: RistrettoPoint,
-	h: RistrettoPoint,
+	pub label: &'static [u8],
+	pub g: RistrettoPoint,
+	pub h: RistrettoPoint,
 }
 
 #[derive(Debug)]
@@ -46,7 +45,6 @@ pub struct Proof {
 	z_a: Vec<Scalar>,
 	z_b: Vec<Scalar>,
 	z_d: Scalar,
-	expected_x: Scalar,
 }
 
 pub struct PrecomputedProofParams {
@@ -218,7 +216,6 @@ pub fn prove<R>(
 		z_a,
 		z_b,
 		z_d,
-		expected_x: x,
 	})
 }
 
@@ -286,7 +283,7 @@ pub fn verify<R>(
 	params: &PublicParams,
 	rng: &mut R,
 	pubkeys: &[RistrettoPoint],
-	proof: Proof,
+	proof: &Proof,
 ) -> Result<bool, VerifyError>
 	where
 		R: RngCore + CryptoRng,
@@ -312,7 +309,6 @@ pub fn verify<R>(
 		z_a,
 		z_b,
 		z_d,
-		expected_x,
 	} = proof;
 
 	transcript.append_message(b"c_l", &serialize_points(&c_l));
@@ -360,7 +356,7 @@ pub fn verify<R>(
 		g_scalar: -z_d,
 		h_scalar: Scalar::zero(),
 		scalars: c_exp.chain(c_d_exp.into_iter()).collect(),
-		points: c.into_iter().cloned().chain(c_d.into_iter()).collect(),
+		points: c.into_iter().chain(c_d.into_iter()).cloned().collect(),
 	});
 
 	Ok(VerifyCondition::verify_many(params, rng, conditions))
@@ -388,19 +384,11 @@ fn pad_ring(pubkeys: &[RistrettoPoint]) -> (Vec<&RistrettoPoint>, u32, u32) {
 	(c, n, log_n)
 }
 
-fn bits_u32_le(x: u32) -> [bool; 32] {
-	let mut bits = [false; 32];
-	for i in 0..32 {
-		bits[i] = ((x >> i) & 1) == 1;
-	}
-	bits
-}
-
 fn pedersen_commit(params: &PublicParams, x: &Scalar, r: &Scalar) -> RistrettoPoint {
 	RistrettoPoint::multiscalar_mul(vec![x, r], vec![params.h, params.g])
 }
 
-fn compute_p_coefficients(
+pub fn compute_p_coefficients(
 	params: &PrecomputedProofParams,
 	n: u32,
 	log_n: u32,
@@ -442,15 +430,11 @@ fn compute_p_coefficients(
 		}
 	}
 
-	let x_powers_mat = MatrixNN::vandermonde(&x);
-
 	// Subtract away the only degree log_n monomial, ensuring all polynomials are degree <log_n.
 	for k in 0..(log_n as usize) {
 		v_mat[(idx as usize, k)] -= x_n_power[k];
 	}
 
-	let x_powers_inv = x_powers_mat.inverse()
-		.expect("vandermonde matrix with distinct, non-zero points must be invertible");
 	Ok(&v_mat * &(params.interpolation_mat().into()))
 }
 
@@ -475,7 +459,6 @@ mod tests {
 	use super::*;
 
 	use rand::{Rng, SeedableRng, rngs::StdRng};
-	use crate::ProofError::PrecomputedParamsError;
 
 	#[test]
 	fn prove_and_verify() {
@@ -499,6 +482,6 @@ mod tests {
 
 		let proof = prove(&params, &proof_params, &mut rng, &pubkeys, idx as u32, keys[idx])
 			.unwrap();
-		assert!(verify(&params, &mut rng, &pubkeys, proof).unwrap());
+		assert!(verify(&params, &mut rng, &pubkeys, &proof).unwrap());
 	}
 }

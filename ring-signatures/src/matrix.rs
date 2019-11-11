@@ -51,7 +51,7 @@ impl MatrixMN {
 	}
 
 	// This consumes self as it is possible to implement in-place even though the current.
-	pub fn transpose(mut self) -> Self {
+	pub fn transpose(self) -> Self {
 		let mut output = MatrixMN::zeros(self.n, self.m);
 		for i in 0..self.m {
 			for j in 0..self.n {
