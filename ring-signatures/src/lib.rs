@@ -71,7 +71,6 @@ pub fn prove<R>(
 	}
 
 	let mut transcript = Transcript::new(params.label);
-	transcript.append_u64(b"RING LEN", len as u64);
 	transcript.append_message(b"RING", &serialize_points(pubkeys));
 
 	let mut rng = transcript
@@ -163,13 +162,13 @@ pub fn prove<R>(
 	})
 }
 
-struct VerifyCondition {
+pub struct VerifyCondition {
 	static_scalars: Vec<Scalar>,
 	dynamic_scalars: HashMap<[u8; 32], Scalar>,
 }
 
 impl VerifyCondition {
-	fn new<I1, I2, I3>(
+	pub fn new<I1, I2, I3>(
 		g_scalar: Scalar,
 		h_scalar: Scalar,
 		c_scalars: I1,
@@ -194,7 +193,8 @@ impl VerifyCondition {
 		}
 	}
 
-	fn scale(mut self, x: Scalar) -> VerifyCondition {
+	// TODO: Use Mul trait.
+	pub fn scale(mut self, x: Scalar) -> VerifyCondition {
 		for scalar in self.static_scalars.iter_mut() {
 			*scalar *= &x;
 		}
@@ -204,7 +204,8 @@ impl VerifyCondition {
 		self
 	}
 
-	fn combine(mut self, other: VerifyCondition) -> VerifyCondition {
+	// TODO: Use Add trait.
+	pub fn combine(mut self, other: VerifyCondition) -> VerifyCondition {
 		for (scalar1, scalar2) in self.static_scalars.iter_mut().zip(other.static_scalars.into_iter()) {
 			*scalar1 += &scalar2;
 		}
@@ -222,7 +223,7 @@ impl VerifyCondition {
 		self
 	}
 
-	fn verify(&self, static_points: &VartimeRistrettoPrecomputation) -> bool {
+	pub fn verify(&self, static_points: &VartimeRistrettoPrecomputation) -> bool {
 		let (dynamic_scalars, dynamic_points): (Vec<Scalar>, Vec<RistrettoPoint>) =
 			self.dynamic_scalars.iter()
 				.map(|(point_repr, scalar)| {
@@ -240,7 +241,7 @@ impl VerifyCondition {
 		).is_identity()
 	}
 
-	fn verify_many<R, I>(
+	pub fn verify_many<R, I>(
 		rng: &mut R,
 		static_points: &VartimeRistrettoPrecomputation,
 		conditions: I,
@@ -265,27 +266,18 @@ impl VerifyCondition {
 
 /// :param: c a vector of Pedersen commitments
 /// :param: pi a proof tuple
-pub fn verify<R>(
-	params: &PublicParams,
-	static_points: &VartimeRistrettoPrecomputation,
-	rng: &mut R,
-	pubkeys: &[RistrettoPoint],
-	proof: &Proof,
-) -> Result<bool, VerifyError>
-	where
-		R: RngCore + CryptoRng,
+pub fn verify(mut transcript: Transcript, ring_len: usize, proof: &Proof)
+	-> Result<Vec<VerifyCondition>, VerifyError>
 {
-	let len = u32::try_from(pubkeys.len())
+	let len = u32::try_from(ring_len)
 		.map_err(|_| VerifyError::RingTooLarge)?;
 	if len == 0 {
 		return Err(VerifyError::RingIsEmpty);
 	}
 
-	let mut transcript = Transcript::new(params.label);
-	transcript.append_u64(b"RING LEN", len as u64);
-	transcript.append_message(b"RING", &serialize_points(pubkeys));
-
-	let (_, n, log_n) = pad_ring(pubkeys);
+	// len is in (0, 2^32), so leading_zeros must be strictly less than 32.
+	let log_n = 32 - (len - 1).leading_zeros();
+	let n = 1 << log_n;
 
 	let Proof {
 		c_l,
@@ -324,16 +316,16 @@ pub fn verify<R>(
 		));
 	}
 
+	let f0 = f.iter()
+		.map(|f_j| x - f_j)
+		.collect::<Vec<_>>();
+	let f1 = f;
 	let c_exp = (0..n as usize)
 		.map(|i| {
 			(0..log_n as usize)
 				.map(|j| {
 					let i_j = (i >> j) & 1;
-					if i_j == 0 {
-						x - f[j]
-					} else {
-						f[j]
-					}
+					if i_j == 0 { f0[j] } else { f1[j] }
 				})
 				.fold(Scalar::one(), |prod, f_ij| prod * f_ij)
 		});
@@ -349,10 +341,10 @@ pub fn verify<R>(
 		c_d,
 	));
 
-	Ok(VerifyCondition::verify_many(rng, static_points, conditions))
+	Ok(conditions)
 }
 
-fn serialize_points(c: &[RistrettoPoint]) -> Vec<u8> {
+pub fn serialize_points(c: &[RistrettoPoint]) -> Vec<u8> {
 	let mut output = Vec::with_capacity(32 * c.len());
 	for c_i in c.iter() {
 		output.extend_from_slice(c_i.compress().as_bytes());
@@ -475,7 +467,11 @@ mod tests {
 
 		let proof = prove(&params, &mut rng, &pubkeys, idx as u32, keys[idx]).unwrap();
 
+		let mut partial_transcript = Transcript::new(params.label);
+		partial_transcript.append_message(b"RING", &serialize_points(&pubkeys));
+
 		let static_points = precompute_verifier_static_points(&params, &pubkeys);
-		assert!(verify(&params, &static_points, &mut rng, &pubkeys, &proof).unwrap());
+		let conditions = verify(partial_transcript.clone(), pubkeys.len(), &proof).unwrap();
+		assert!(VerifyCondition::verify_many(&mut rng, &static_points, conditions));
 	}
 }
